@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Roblox -> Discord friend activity notifier.
+Roblox -> Discord friend activity notifier (status board version).
 
-Polls the public (no-login) Roblox presence API for a list of usernames you
-specify, and posts a message to a Discord webhook whenever one of them comes
-online / starts playing a game.
+Instead of posting a new message every time someone's status changes, this
+keeps ONE Discord message and edits it in place whenever anything changes.
+The message shows every tracked friend as a little box:
 
-No Roblox account credentials are used anywhere in this script. Because of
-that, friends whose privacy setting for "who can see what I'm playing" is set
-to "Friends" (rather than "Everyone") will only show up as generic
-"online" with no game name -- Roblox simply doesn't return that detail to an
-unauthenticated caller. Friends set to "Everyone" will show full game info.
+    `PlayerName`
+    Online / Offline
+    Game: N/A  (or the game name if they're playing one)
+
+No Roblox login or cookie required -- uses Roblox's public presence API
+only. A friend whose "who can see what I'm playing" privacy setting is
+"Friends" (not "Everyone") will show as Online with Game: N/A, since Roblox
+doesn't hand out that detail to an unauthenticated caller.
 
 Setup:
     1. pip install -r requirements.txt
@@ -18,8 +21,9 @@ Setup:
        ROBLOX_USERNAMES.
     3. python notifier.py
 
-State is kept in state.json next to this script so that restarting the
-script does not re-fire alerts for friends who were already online.
+State (which Discord message to edit, plus last known status per friend) is
+kept in state.json next to this script, so restarting the script keeps
+editing the same message instead of creating a new one.
 """
 
 import json
@@ -42,16 +46,12 @@ ROBLOX_USERNAMES = [
     u.strip() for u in os.environ.get("ROBLOX_USERNAMES", "").split(",") if u.strip()
 ]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
-NOTIFY_ON_ONLINE_NOT_JUST_INGAME = os.environ.get(
-    "NOTIFY_ON_ONLINE_NOT_JUST_INGAME", "true"
-).lower() in ("1", "true", "yes")
 
 STATE_FILE = Path(__file__).parent / "state.json"
 
 USERNAME_LOOKUP_URL = "https://users.roblox.com/v1/usernames/users"
 PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 GAMES_URL = "https://games.roblox.com/v1/games"
-AVATAR_URL = "https://thumbnails.roblox.com/v1/users/avatar-headshot"
 
 # userPresenceType values returned by the Roblox presence API
 OFFLINE, ONLINE, INGAME, INSTUDIO = 0, 1, 2, 3
@@ -79,7 +79,7 @@ def save_state(state):
 
 
 def resolve_usernames(usernames):
-    """username -> userId, tolerant of a few not resolving."""
+    """username -> {id, username}, tolerant of a few not resolving."""
     if not usernames:
         return {}
     resp = session.post(
@@ -89,8 +89,8 @@ def resolve_usernames(usernames):
     )
     resp.raise_for_status()
     data = resp.json().get("data", [])
-    found = {row["requestedUsername"]: row for row in data}
-    missing = [u for u in usernames if u not in found]
+    found_names = {row["requestedUsername"] for row in data}
+    missing = [u for u in usernames if u not in found_names]
     if missing:
         log(f"WARNING: could not resolve these Roblox usernames: {missing}")
     return {row["id"]: {"username": row["name"]} for row in data}
@@ -124,79 +124,90 @@ def get_game_name(universe_id):
     return name
 
 
-def get_avatar_url(user_id):
-    try:
-        resp = session.get(
-            AVATAR_URL,
-            params={
-                "userIds": user_id,
-                "size": "150x150",
-                "format": "Png",
-                "isCircular": "false",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        return data[0]["imageUrl"] if data else None
-    except requests.RequestException:
-        return None
-
-
-def presence_label(presence):
+def describe_presence(presence):
+    """Return (is_online: bool, game_text: str) for one presence record."""
+    if presence is None:
+        return False, "N/A"
     ptype = presence.get("userPresenceType", OFFLINE)
     if ptype == INGAME:
-        universe_id = presence.get("universeId")
-        game_name = get_game_name(universe_id)
-        return ("in_game", game_name)
+        name = get_game_name(presence.get("universeId"))
+        return True, (name if name else "Hidden (privacy setting)")
     if ptype == INSTUDIO:
-        return ("in_studio", None)
+        return True, "Roblox Studio"
     if ptype == ONLINE:
-        return ("online", None)
-    return ("offline", None)
+        return True, "N/A"
+    return False, "N/A"
 
 
-def send_discord_alert(username, user_id, status, game_name):
-    if not DISCORD_WEBHOOK_URL:
-        log("DISCORD_WEBHOOK_URL is not set -- skipping Discord post.")
-        return
+def parse_webhook_url(url):
+    # https://discord.com/api/webhooks/<id>/<token>
+    parts = url.rstrip("/").split("/")
+    return parts[-2], parts[-1]  # webhook_id, webhook_token
 
-    if status == "in_game" and game_name:
-        title = f"{username} started playing {game_name}"
-        description = f"[View profile](https://www.roblox.com/users/{user_id}/profile)"
-    elif status == "in_game":
-        title = f"{username} is in a game"
-        description = (
-            "Game name unavailable (their privacy setting hides it from "
-            "non-friends).\n"
-            f"[View profile](https://www.roblox.com/users/{user_id}/profile)"
-        )
-    elif status == "in_studio":
-        title = f"{username} is in Roblox Studio"
-        description = f"[View profile](https://www.roblox.com/users/{user_id}/profile)"
-    else:
-        title = f"{username} just came online"
-        description = f"[View profile](https://www.roblox.com/users/{user_id}/profile)"
 
-    avatar_url = get_avatar_url(user_id)
+def build_board_embed(users, presences):
+    fields = []
+    online_count = 0
+    for uid, info in users.items():
+        username = info["username"]
+        is_online, game_text = describe_presence(presences.get(uid))
+        if is_online:
+            online_count += 1
+            status_line = "🟢 **Online**"
+        else:
+            status_line = "⚪ Offline"
+        value = f"{status_line}\nGame: {game_text}"
+        fields.append({"name": f"`{username}`", "value": value, "inline": True})
+
     embed = {
-        "title": title,
-        "description": description,
-        "color": 0x00A2FF,
+        "title": "🎮 Roblox Friend Activity",
+        "description": f"{online_count} of {len(users)} tracked friend(s) online",
+        "color": 0x00A2FF if online_count else 0x5A5A5A,
+        "fields": fields,
+        "footer": {"text": "Last updated"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    if avatar_url:
-        embed["thumbnail"] = {"url": avatar_url}
+    return embed
 
-    payload = {"embeds": [embed]}
-    try:
-        resp = session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
-        if resp.status_code >= 300:
-            log(f"Discord webhook returned {resp.status_code}: {resp.text}")
+
+def post_or_edit_board(embed, state):
+    """Post the board message once, then edit that same message from then on."""
+    webhook_id, webhook_token = parse_webhook_url(DISCORD_WEBHOOK_URL)
+    message_id = state.get("_message_id")
+
+    if message_id:
+        edit_url = (
+            f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}"
+            f"/messages/{message_id}"
+        )
+        resp = session.patch(edit_url, json={"embeds": [embed]}, timeout=15)
+        if resp.status_code == 404:
+            log("Previous board message no longer exists -- posting a new one.")
+            message_id = None
+        elif resp.status_code >= 300:
+            log(f"Failed to edit board message ({resp.status_code}): {resp.text}")
+            return
         else:
-            log(f"Alert sent: {title}")
-    except requests.RequestException as e:
-        log(f"Failed to post to Discord: {e}")
+            log("Board message updated.")
+            return
+
+    # No message yet (first run, or the old one was deleted) -- create it.
+    post_url = f"{DISCORD_WEBHOOK_URL}?wait=true"
+    resp = session.post(post_url, json={"embeds": [embed]}, timeout=15)
+    if resp.status_code >= 300:
+        log(f"Failed to post board message ({resp.status_code}): {resp.text}")
+        return
+    state["_message_id"] = resp.json()["id"]
+    log(f"Posted new board message (id {state['_message_id']}).")
+
+
+def board_signature(users, presences):
+    """A cheap fingerprint of the board's visible content, to skip no-op edits."""
+    parts = []
+    for uid in users:
+        is_online, game_text = describe_presence(presences.get(uid))
+        parts.append(f"{uid}:{is_online}:{game_text}")
+    return "|".join(parts)
 
 
 def main():
@@ -214,41 +225,26 @@ def main():
         sys.exit(1)
 
     user_ids = list(users.keys())
-    state = load_state()  # user_id (str) -> last status string
+    state = load_state()
 
     log(f"Tracking: {[u['username'] for u in users.values()]}")
     log(f"Polling every {POLL_INTERVAL_SECONDS}s. Press Ctrl+C to stop.")
 
+    last_signature = state.get("_signature")
+
     while True:
         try:
             presences = get_presences(user_ids)
-            for uid in user_ids:
-                presence = presences.get(uid)
-                if presence is None:
-                    continue
-                username = users[uid]["username"]
-                status, game_name = presence_label(presence)
-                prev_status = state.get(str(uid), "offline")
+            signature = board_signature(users, presences)
 
-                went_online = prev_status == "offline" and status != "offline"
-                changed_game = (
-                    status == "in_game"
-                    and prev_status == "in_game"
-                    and state.get(f"{uid}_game") != game_name
-                )
-
-                should_alert = status == "in_game" and (went_online or changed_game)
-                if not should_alert and NOTIFY_ON_ONLINE_NOT_JUST_INGAME:
-                    should_alert = went_online and status in ("online", "in_studio")
-
-                if should_alert:
-                    send_discord_alert(username, uid, status, game_name)
-
-                state[str(uid)] = status
-                if status == "in_game":
-                    state[f"{uid}_game"] = game_name
-
-            save_state(state)
+            if signature != last_signature:
+                embed = build_board_embed(users, presences)
+                post_or_edit_board(embed, state)
+                state["_signature"] = signature
+                save_state(state)
+                last_signature = signature
+            else:
+                log("No change since last check -- skipping Discord edit.")
         except requests.RequestException as e:
             log(f"Roblox API request failed, will retry next cycle: {e}")
 

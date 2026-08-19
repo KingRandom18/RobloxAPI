@@ -1,12 +1,29 @@
 # Roblox -> Discord friend activity notifier
 
-Watches a list of Roblox usernames and posts to a Discord webhook whenever
-one of them comes online / starts playing a game. No Roblox login or cookie
-required — it only uses Roblox's public presence API, so there's zero risk
-to your Roblox account. The tradeoff: for a friend whose privacy setting for
-"who can see what I'm playing" is set to "Friends" rather than "Everyone",
-you'll only get a generic "online" alert with no game name, since Roblox
-doesn't hand that detail to an unauthenticated caller.
+Watches a list of Roblox usernames and keeps a single Discord message
+up to date with everyone's status — no Roblox login or cookie required, it
+only uses Roblox's public presence API, so there's zero risk to your Roblox
+account. The tradeoff: for a friend whose privacy setting for "who can see
+what I'm playing" is set to "Friends" rather than "Everyone", you'll see
+them as Online but with `Game: N/A`, since Roblox doesn't hand that detail
+to an unauthenticated caller.
+
+Rather than spamming the channel with a new message every time someone's
+status changes, the bot posts **one** message and edits it in place
+whenever anything changes. It looks like this:
+
+```
+🎮 Roblox Friend Activity
+2 of 3 tracked friend(s) online
+
+`PlayerOne`          `PlayerTwo`          `PlayerThree`
+🟢 Online             🟢 Online             ⚪ Offline
+Game: Obby Simulator  Game: N/A             Game: N/A
+```
+
+Each friend gets their own little box (a Discord embed field), with their
+username in a code block, their Online/Offline status, and the game they're
+playing if that's visible.
 
 ## 1. Create the Discord webhook
 
@@ -21,8 +38,7 @@ doesn't hand that detail to an unauthenticated caller.
 2. Paste your webhook URL into `DISCORD_WEBHOOK_URL`.
 3. Set `ROBLOX_USERNAMES` to a comma-separated list of the exact Roblox
    usernames you want to watch (not display names — the actual @username).
-4. Optionally adjust `POLL_INTERVAL_SECONDS` (default 60) and
-   `NOTIFY_ON_ONLINE_NOT_JUST_INGAME`.
+4. Optionally adjust `POLL_INTERVAL_SECONDS` (default 60).
 
 ## 3. Run it
 
@@ -31,11 +47,12 @@ pip install -r requirements.txt
 python notifier.py
 ```
 
-Leave it running. It checks every `POLL_INTERVAL_SECONDS` and only fires an
-alert on a *transition* (offline -> online/in-game, or switching games) —
-it won't spam you every cycle while someone stays online. Progress/state is
-saved to `state.json` next to the script, so restarting it won't re-fire
-alerts for people who were already online.
+Leave it running. It checks every `POLL_INTERVAL_SECONDS` and only touches
+Discord when something on the board actually changed — it edits the same
+message in place rather than posting a new one each time. The message ID
+and last-known status are saved to `state.json` next to the script, so
+restarting the script keeps editing the same message instead of creating a
+new one each time.
 
 ## 4. Run it 24/7 on a free cloud host (so it works even when your PC is off)
 
